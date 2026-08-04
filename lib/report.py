@@ -4,6 +4,16 @@ from scipy import interpolate
 from django.template.loader import get_template
 from airium import Airium
 from bs4 import BeautifulSoup as bs
+from lib.analysis import calc_cdf_band, _bootstrap_seed
+from lib.thresholds import BOOTSTRAP_ITERATIONS, DEFAULT_BOOTSTRAP_MODE
+
+
+PAGELOAD_CI_NOTE = (
+    "This metric comes from the pageload ping, which by design never carries a "
+    "client identifier, for privacy. Consequently, its confidence intervals are "
+    "clustered by ping submission (document_id) instead of by client_id. Treat "
+    "these intervals as a lower bound on the true uncertainty, not an exact one."
+)
 
 
 # These values are mostly hand-wavy that seem to
@@ -61,6 +71,24 @@ def find_value_at_quantile(values, cdf, q=0.95):
     return None
 
 
+# Mirrors Chart.js's built-in default dataset palette so explicitly-colored
+# datasets (e.g. CI bands) match the auto-colored charts elsewhere in the report.
+CHART_PALETTE_RGB = [
+    "54, 162, 235",  # blue
+    "255, 99, 132",  # red/pink
+    "255, 159, 64",  # orange
+    "255, 205, 86",  # yellow
+    "75, 192, 192",  # green
+    "153, 102, 255",  # purple
+    "201, 203, 207",  # grey
+]
+
+
+def getChartColorForBranchIndex(index):
+    rgb = CHART_PALETTE_RGB[index % len(CHART_PALETTE_RGB)]
+    return {"line": f"rgb({rgb})", "band": f"rgba({rgb}, 0.15)"}
+
+
 def getIconForSegment(segment):
     iconMap = {
         "All": "fa-solid fa-globe",
@@ -86,6 +114,15 @@ class ReportGenerator:
     def __init__(self, data):
         self.data = data
         self.doc = Airium()
+        self.export_data = {"segments": {}}
+
+    def _recordExport(self, segment, metric, metric_type, payload):
+        """Stash a lightweight, JSON-clean summary of a metric's results for the
+        export-JSON button - independent of the HTML tables built alongside it."""
+        self.export_data["segments"].setdefault(segment, {})[metric] = {
+            "type": metric_type,
+            **payload,
+        }
 
     def get_metric_unit(self, metric):
         """Get the unit label for a metric based on its configuration."""
@@ -710,6 +747,13 @@ class ReportGenerator:
                                 def _fmt(v):
                                     return f"+{v:.1f}" if v > 0 else f"{v:.1f}"
 
+                                def _fmt_lift_ci(ci):
+                                    if not ci or ci.get("lower") is None:
+                                        return ""
+                                    lo = ci["lower"] * 100
+                                    hi = ci["upper"] * 100
+                                    return f"({lo:+.1f}%, {hi:+.1f}%)"
+
                                 # Get statistical test results
                                 if (
                                     "tests" in metric_data
@@ -722,7 +766,7 @@ class ReportGenerator:
                                     )
                                     effect = f"{effect_meaning} (p={pval:.2f})"
 
-                                    if pval >= 0.001:
+                                    if pval >= 0.05:
                                         effect = f"None (p={pval:.2f})"
                                         effect_meaning = "None"
                                 else:
@@ -770,6 +814,9 @@ class ReportGenerator:
                                         "median_uplift": _fmt(median_uplift_pct),
                                         "p75_uplift": _fmt(p75_uplift_pct),
                                         "p95_uplift": _fmt(p95_uplift_pct),
+                                        "median_lift_ci": _fmt_lift_ci(metric_data.get("median_lift_ci")),
+                                        "p75_lift_ci": _fmt_lift_ci(metric_data.get("p75_lift_ci")),
+                                        "p95_lift_ci": _fmt_lift_ci(metric_data.get("p95_lift_ci")),
                                         "median_color": median_color,
                                         "p75_color": _color_for(p75_uplift_pct),
                                         "p95_color": _color_for(p95_uplift_pct),
@@ -845,6 +892,17 @@ class ReportGenerator:
                 }
             branches.append(branchInfo)
 
+        self.export_data.update(
+            {
+                "slug": slug,
+                "is_experiment": is_experiment,
+                "startDate": startDate,
+                "endDate": endDate,
+                "channel": channel,
+                "branches": [b["name"] for b in branches],
+            }
+        )
+
         context = {
             "slug": slug,
             "is_experiment": is_experiment,
@@ -856,6 +914,17 @@ class ReportGenerator:
             "branchlen": len(branches),
         }
         self.doc(t.render(context))
+
+    def createExportDataScript(self):
+        def _default(o):
+            if hasattr(o, "item"):  # numpy scalar
+                return o.item()
+            return str(o)
+
+        export_json = json.dumps(self.export_data, indent=2, default=_default)
+        self.doc(
+            f'<script type="application/json" id="catalyst-export-data">{export_json}</script>'
+        )
 
     def createConfigSection(self):
         t = get_template("config.html")
@@ -890,8 +959,9 @@ class ReportGenerator:
             values_int = np.around(np.linspace(0, maxValue, 100), 2).tolist()
 
             datasets = []
-            for branch in self.data["branches"]:
+            for branch_index, branch in enumerate(self.data["branches"]):
                 branch_name = branch["name"] if isinstance(branch, dict) else branch
+                branch_color = getChartColorForBranchIndex(branch_index)
 
                 if (
                     branch_name in self.data
@@ -910,10 +980,32 @@ class ReportGenerator:
                     density_int = cubic_spline_smooth(values, density, values_int)
                     cdf_int = cubic_spline_smooth(values, cdf, values_int)
 
+                    cdf_lower, cdf_upper = None, None
+                    if "bins" in metric_data and "counts" in metric_data:
+                        # Older cached results predate bins/counts storage and
+                        # won't have this - skip the band rather than fail the report.
+                        config = self.data.get("input", {})
+                        bootstrap_mode = config.get("bootstrap_mode", DEFAULT_BOOTSTRAP_MODE)
+                        n_bootstrap = BOOTSTRAP_ITERATIONS.get(bootstrap_mode, BOOTSTRAP_ITERATIONS[DEFAULT_BOOTSTRAP_MODE])
+                        seed = _bootstrap_seed(config.get("slug", ""), metric, branch_name)
+                        band = calc_cdf_band(
+                            bins=metric_data["bins"],
+                            counts=metric_data["counts"],
+                            x_values=values_int,
+                            n_bootstrap=n_bootstrap,
+                            seed=seed,
+                            replicates=metric_data.get("bootstrap_replicates"),
+                        )
+                        cdf_lower, cdf_upper = band["lower"], band["upper"]
+
                     dataset = {
                         "branch": branch_name,
                         "cdf": cdf_int,
                         "density": density_int,
+                        "cdf_lower": cdf_lower,
+                        "cdf_upper": cdf_upper,
+                        "line_color": branch_color["line"],
+                        "band_color": branch_color["band"],
                     }
 
                     datasets.append(dataset)
@@ -1120,6 +1212,8 @@ class ReportGenerator:
         metric_title = first_dataset.get("desc", metric)
         value_label = "Count"  # Default label, could be made configurable
 
+        self._recordExport(segment, metric, "scalar", {"branches": datasets})
+
         context = {
             "segment": segment,
             "metric": metric,
@@ -1157,6 +1251,8 @@ class ReportGenerator:
         def format_pct(v):
             sign = "+" if v > 0 else ""
             return f"{sign}{v:.2f}%"
+
+        bootstrap_iterations = None
 
         for branch in self.data["branches"]:
             branch_name = branch["name"] if isinstance(branch, dict) else branch
@@ -1233,15 +1329,32 @@ class ReportGenerator:
                     # Keep mean's percent uplift available for the chart label
                     dataset["uplift"] = f"{dataset['mean_pct_raw']:.1f}"
 
+                    def _fmt_lift_ci_num(ci):
+                        if not ci or ci.get("lower") is None:
+                            return ""
+                        lo = ci["lower"] * 100
+                        hi = ci["upper"] * 100
+                        return f"({lo:+.1f}%, {hi:+.1f}%)"
+
+                    dataset["median_lift_ci"] = _fmt_lift_ci_num(metric_data.get("median_lift_ci"))
+                    dataset["p75_lift_ci"] = _fmt_lift_ci_num(metric_data.get("p75_lift_ci"))
+                    dataset["p95_lift_ci"] = _fmt_lift_ci_num(metric_data.get("p95_lift_ci"))
+
                 if branch_name != control_name and "tests" in metric_data:
                     for test_name, test_data in metric_data["tests"].items():
                         effect = "{0:.2f}".format(test_data.get("effect", 0))
                         pval = "{0:.2g}".format(test_data.get("p-value", 1.0))
                         dataset[test_name] = {"effect": effect, "pval": pval}
 
+                if metric_data.get("bootstrap_iterations"):
+                    bootstrap_iterations = metric_data["bootstrap_iterations"]
+
                 datasets.append(dataset)
 
         unit = self.get_metric_unit(metric)
+        self._recordExport(
+            segment, metric, "numerical", {"unit": unit, "branches": datasets}
+        )
 
         # Build chart data: x-axis = percentile (median, p75),
         # one series per branch so cross-branch comparison is grouped.
@@ -1295,6 +1408,7 @@ class ReportGenerator:
             "datasets": datasets,
             "unit": unit,
             "charts": charts,
+            "bootstrap_iterations": bootstrap_iterations,
         }
         self.doc(t.render(context))
 
@@ -1420,6 +1534,13 @@ class ReportGenerator:
                     "branch_rows": branch_rows,
                 }
             )
+
+        self._recordExport(
+            segment,
+            metric,
+            "categorical",
+            {"unit": unit, "aggregate": aggregate, "labels": labels, "branches": datasets},
+        )
 
         context = {
             "labels": labels,
@@ -1557,8 +1678,16 @@ class ReportGenerator:
         # Wrap content in cell container for proper layout
         with self.doc.div(id=f"{segment}-{metric}", klass="cell"):
             # Add title for metric
+            is_pageload_event_metric = "input" in self.data and metric in self.data[
+                "input"
+            ].get("pageload_event_metrics", {})
             with self.doc.div(klass="title"):
                 self.doc(f"({segment}) - {metric}")
+                if data_type == "numerical" and is_pageload_event_metric:
+                    self.doc.i(
+                        klass="fa-solid fa-circle-info ci-note",
+                        title=PAGELOAD_CI_NOTE,
+                    )
 
             # Check for overflow warning in any branch
             overflow_warning = None
@@ -1766,6 +1895,13 @@ class ReportGenerator:
                     }
                 )
 
+        self._recordExport(
+            segment,
+            metric,
+            "labeled_percentiles",
+            {"unit": unit, "labels": labels, "branches": datasets},
+        )
+
         context = {
             "labels": labels,
             "datasets": datasets,
@@ -1847,6 +1983,10 @@ class ReportGenerator:
                 }
             )
 
+        self._recordExport(
+            segment, metric, "quantity_percentiles", {"unit": unit, "branches": branch_rows}
+        )
+
         context = {
             "metric": metric,
             "segment": segment,
@@ -1885,6 +2025,8 @@ class ReportGenerator:
 
         # Dump the config and queries used for the report
         self.createConfigSection()
+
+        self.createExportDataScript()
 
         self.endDocument()
 
