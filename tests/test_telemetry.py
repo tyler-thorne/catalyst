@@ -320,8 +320,9 @@ class TestTelemetry(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            # This should call sys.exit(1)
-            TelemetryClient(temp_dir, config, skipCache=False)
+            tc = TelemetryClient(temp_dir, config, skipCache=False)
+            # Auth is deferred — trigger it by accessing the client property
+            _ = tc.client
             mock_exit.assert_called_once_with(1)
 
 
