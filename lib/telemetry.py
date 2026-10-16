@@ -10,6 +10,7 @@ from lib.thresholds import (
     get_min_sample_size,
     BOOTSTRAP_ITERATIONS,
     DEFAULT_BOOTSTRAP_MODE,
+    DEFAULT_ENABLE_BOOTSTRAP_CI,
 )
 from lib.analysis import compute_client_cluster_bootstrap
 
@@ -370,6 +371,48 @@ class TelemetryClient:
             # Manual percentage - convert to threshold/modulus format
             return sampling_config, None
 
+    def _bootstrapEnabled(self):
+        return self.config.get("enable_bootstrap_ci", DEFAULT_ENABLE_BOOTSTRAP_CI)
+
+    def _histogramCacheFile(self, histogram):
+        """Bootstrap-path histograms carry replicates the flat path doesn't, so
+        they get their own cache file and flipping the flag never misreads one
+        shape as the other."""
+        hist_config = self.config["histograms"][histogram]
+        bootstrap = (
+            self._bootstrapEnabled()
+            and hist_config.get("kind") == "numerical"
+            and hist_config.get("glean")
+        )
+        suffix = ".bootstrap" if bootstrap else ""
+        return os.path.join(
+            self.dataDir,
+            f"{self.config['slug']}-{histogram.split('.')[-1]}{suffix}.pkl",
+        )
+
+    def _pageloadEventCacheFile(self, metric):
+        suffix = ".bootstrap" if self._bootstrapEnabled() else ""
+        return os.path.join(
+            self.dataDir, f"{self.config['slug']}-pageload-events-{metric}{suffix}.pkl"
+        )
+
+    def _insufficientSampleSegments(self, df, histogram):
+        """Branch/segment combinations below the minimum sample size. The
+        floor is part of the bootstrap CI upgrade, so it only applies when
+        `enable_bootstrap_ci` is on."""
+        if not self._bootstrapEnabled():
+            return []
+        hist_config = self.config["histograms"].get(histogram, {})
+        return getInvalidBranchSegments(
+            df,
+            histogram,
+            self.config["branches"],
+            self.config["segments"],
+            distribution_type=hist_config.get("distribution_type", ""),
+            kind=hist_config.get("kind", ""),
+            override=self.config.get("min_sample_size_override"),
+        )
+
     def _processHistogramsInParallel(self, histograms_to_process, is_experiment=True):
         """Process histograms in parallel using ThreadPoolExecutor."""
         if self.max_workers <= 1 or len(histograms_to_process) <= 1:
@@ -414,17 +457,7 @@ class TelemetryClient:
                         print(f"Empty dataset found, marking for removal: {histogram}")
                         remove.append(histogram)
                     else:
-                        hist_config = self.config["histograms"].get(histogram, {})
-                        override = self.config.get("min_sample_size_override")
-                        invalid = getInvalidBranchSegments(
-                            df,
-                            histogram,
-                            self.config["branches"],
-                            self.config["segments"],
-                            distribution_type=hist_config.get("distribution_type", ""),
-                            kind=hist_config.get("kind", ""),
-                            override=override,
-                        )
+                        invalid = self._insufficientSampleSegments(df, histogram)
                         if invalid:
                             print(
                                 f"Insufficient sample size, marking for removal: {histogram}"
@@ -458,17 +491,7 @@ class TelemetryClient:
                     print(f"Empty dataset found, marking for removal: {histogram}")
                     remove.append(histogram)
                 else:
-                    hist_config = self.config["histograms"].get(histogram, {})
-                    override = self.config.get("min_sample_size_override")
-                    invalid = getInvalidBranchSegments(
-                        df,
-                        histogram,
-                        self.config["branches"],
-                        self.config["segments"],
-                        distribution_type=hist_config.get("distribution_type", ""),
-                        kind=hist_config.get("kind", ""),
-                        override=override,
-                    )
+                    invalid = self._insufficientSampleSegments(df, histogram)
                     if invalid:
                         print(
                             f"Insufficient sample size, marking for removal: {histogram}"
@@ -1109,10 +1132,7 @@ class TelemetryClient:
         uses -- downstream callers never need to know how the data was
         fetched or bootstrapped."""
         slug = config["slug"]
-        filenames = {
-            h: os.path.join(self.dataDir, f"{slug}-{h.split('.')[-1]}.pkl")
-            for h in histogram_list
-        }
+        filenames = {h: self._histogramCacheFile(h) for h in histogram_list}
 
         cached = {h: self.checkForExistingData(f) for h, f in filenames.items()}
         if all(df is not None for df in cached.values()):
@@ -1371,8 +1391,7 @@ class TelemetryClient:
 
     def getHistogramData(self, config, histogram):
         slug = config["slug"]
-        hist_name = histogram.split(".")[-1]
-        filename = os.path.join(self.dataDir, f"{slug}-{hist_name}.pkl")
+        filename = self._histogramCacheFile(histogram)
 
         df = self.checkForExistingData(filename)
         if df is not None:
@@ -1410,7 +1429,14 @@ class TelemetryClient:
         it keeps the client-cluster bootstrap as the only bootstrap method
         for glean numerical histograms, retiring the old in-SQL
         FARM_FINGERPRINT-array path (generateHistogramQuery_OS_segments_glean)
-        for this case entirely instead of leaving two methods to coexist."""
+        for this case entirely instead of leaving two methods to coexist.
+
+        Skipped entirely when `enable_bootstrap_ci` is off -- getHistogramData's
+        per-metric glean path (the same query as before this upgrade) handles
+        fetching instead, avoiding the client-cluster bootstrap's extra
+        BQ/compute cost."""
+        if not self._bootstrapEnabled():
+            return
         if not segments_are_all_OS(self.config["segments"]):
             return
 
@@ -1649,7 +1675,7 @@ class TelemetryClient:
         bootstrap_replicates) shape the old flat aggregate query produced,
         so collectResultsFromQuery_OS_segments needs no new code path."""
         slug = self.config["slug"]
-        filename = os.path.join(self.dataDir, f"{slug}-pageload-events-{metric}.pkl")
+        filename = self._pageloadEventCacheFile(metric)
 
         df = self.checkForExistingData(filename)
         if df is not None:
@@ -1658,6 +1684,22 @@ class TelemetryClient:
         if not segments_are_all_OS(self.config["segments"]):
             print("No current support for generic pageload event queries.")
             sys.exit(1)
+
+        if not self._bootstrapEnabled():
+            # Bridge-flag off: use the old flat aggregate query -- no
+            # per-document bucket arrays, no bootstrap replicates.
+            query = self.generatePageloadEventQuery_OS_segments(metric)
+            print("Running query:\n" + query)
+            import time
+
+            start_time = time.time()
+            job = self.client.query(query)
+            df = job.to_dataframe()
+            query_time = time.time() - start_time
+            print(f"Query completed in {query_time:.1f} seconds")
+            print(f"Writing '{slug}' pageload event results to disk.")
+            df.to_pickle(filename)
+            return df
 
         query = self.generatePageloadEventQuery_OS_segments_document_arrays(metric)
 

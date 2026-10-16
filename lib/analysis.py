@@ -2,7 +2,11 @@ from scipy import stats, sparse
 import numpy as np
 import pandas as pd
 import hashlib
-from lib.thresholds import BOOTSTRAP_ITERATIONS, DEFAULT_BOOTSTRAP_MODE
+from lib.thresholds import (
+    BOOTSTRAP_ITERATIONS,
+    DEFAULT_BOOTSTRAP_MODE,
+    DEFAULT_ENABLE_BOOTSTRAP_CI,
+)
 
 
 # Expand the histogram into an array of values
@@ -671,53 +675,57 @@ class DataAnalyzer:
                         control_data, data, result_location
                     )
 
-                    bootstrap_mode = self.config.get(
-                        "bootstrap_mode", DEFAULT_BOOTSTRAP_MODE
+                    enable_bootstrap_ci = self.config.get(
+                        "enable_bootstrap_ci", DEFAULT_ENABLE_BOOTSTRAP_CI
                     )
-                    n_bootstrap = BOOTSTRAP_ITERATIONS.get(
-                        bootstrap_mode, BOOTSTRAP_ITERATIONS[DEFAULT_BOOTSTRAP_MODE]
-                    )
-                    result_location["bootstrap_iterations"] = n_bootstrap
-                    seed = _bootstrap_seed(
-                        self.config.get("slug", ""),
-                        metric_name,
-                        branch,
-                    )
-                    ci = calc_bootstrap_ci(
-                        control_bins=control_data["bins"],
-                        control_counts=control_data["counts"],
-                        treatment_bins=data["bins"],
-                        treatment_counts=data["counts"],
-                        quantiles=(0.5, 0.75, 0.95),
-                        n_bootstrap=n_bootstrap,
-                        seed=seed,
-                        control_replicates=control_data.get("bootstrap_replicates"),
-                        treatment_replicates=data.get("bootstrap_replicates"),
-                    )
-                    result_location["median_ci"] = {
-                        "lower": ci[0.5]["treatment_lower"],
-                        "upper": ci[0.5]["treatment_upper"],
-                    }
-                    result_location["p75_ci"] = {
-                        "lower": ci[0.75]["treatment_lower"],
-                        "upper": ci[0.75]["treatment_upper"],
-                    }
-                    result_location["p95_ci"] = {
-                        "lower": ci[0.95]["treatment_lower"],
-                        "upper": ci[0.95]["treatment_upper"],
-                    }
-                    result_location["median_lift_ci"] = {
-                        "lower": ci[0.5]["lift_lower"],
-                        "upper": ci[0.5]["lift_upper"],
-                    }
-                    result_location["p75_lift_ci"] = {
-                        "lower": ci[0.75]["lift_lower"],
-                        "upper": ci[0.75]["lift_upper"],
-                    }
-                    result_location["p95_lift_ci"] = {
-                        "lower": ci[0.95]["lift_lower"],
-                        "upper": ci[0.95]["lift_upper"],
-                    }
+                    if enable_bootstrap_ci:
+                        bootstrap_mode = self.config.get(
+                            "bootstrap_mode", DEFAULT_BOOTSTRAP_MODE
+                        )
+                        n_bootstrap = BOOTSTRAP_ITERATIONS.get(
+                            bootstrap_mode, BOOTSTRAP_ITERATIONS[DEFAULT_BOOTSTRAP_MODE]
+                        )
+                        result_location["bootstrap_iterations"] = n_bootstrap
+                        seed = _bootstrap_seed(
+                            self.config.get("slug", ""),
+                            metric_name,
+                            branch,
+                        )
+                        ci = calc_bootstrap_ci(
+                            control_bins=control_data["bins"],
+                            control_counts=control_data["counts"],
+                            treatment_bins=data["bins"],
+                            treatment_counts=data["counts"],
+                            quantiles=(0.5, 0.75, 0.95),
+                            n_bootstrap=n_bootstrap,
+                            seed=seed,
+                            control_replicates=control_data.get("bootstrap_replicates"),
+                            treatment_replicates=data.get("bootstrap_replicates"),
+                        )
+                        result_location["median_ci"] = {
+                            "lower": ci[0.5]["treatment_lower"],
+                            "upper": ci[0.5]["treatment_upper"],
+                        }
+                        result_location["p75_ci"] = {
+                            "lower": ci[0.75]["treatment_lower"],
+                            "upper": ci[0.75]["treatment_upper"],
+                        }
+                        result_location["p95_ci"] = {
+                            "lower": ci[0.95]["treatment_lower"],
+                            "upper": ci[0.95]["treatment_upper"],
+                        }
+                        result_location["median_lift_ci"] = {
+                            "lower": ci[0.5]["lift_lower"],
+                            "upper": ci[0.5]["lift_upper"],
+                        }
+                        result_location["p75_lift_ci"] = {
+                            "lower": ci[0.75]["lift_lower"],
+                            "upper": ci[0.75]["lift_upper"],
+                        }
+                        result_location["p95_lift_ci"] = {
+                            "lower": ci[0.95]["lift_lower"],
+                            "upper": ci[0.95]["lift_upper"],
+                        }
 
     def processCategoricalMetrics(self, categorical_metrics):
         """Process all categorical metrics with unified algorithms."""

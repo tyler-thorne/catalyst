@@ -19,6 +19,12 @@ BOOTSTRAP_ITERATIONS = {
 }
 DEFAULT_BOOTSTRAP_MODE = "production"
 
+# Bridge flag: `enable_bootstrap_ci` in the experiment YAML config. Defaults
+# off so existing configs keep producing today's no-CI report; set to true
+# per-report to opt into the bootstrap CI / CDF band engine. Temporary --
+# meant to come out once the new engine is trusted broadly.
+DEFAULT_ENABLE_BOOTSTRAP_CI = False
+
 MIN_SAMPLE_SIZE = {
     "timing_distribution": 50000,
     "memory_distribution": 25000,

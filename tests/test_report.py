@@ -1,3 +1,4 @@
+import copy
 import unittest
 from lib.report import ReportGenerator
 from lib.generate import setupDjango
@@ -328,6 +329,17 @@ class TestHTMLReportGeneration(unittest.TestCase):
         self.assertGreater(
             len(numerical_sections), 0, "Should still have numerical metric sections"
         )
+
+    def test_significance_column_follows_bootstrap_flag(self):
+        """Flag off shows the MWU verdict; flag on shows the lift CI verdict."""
+        for enabled, expected in ((False, "None (p=0.01)"), (True, "> median <")):
+            data = copy.deepcopy(self.test_data)
+            data["input"]["enable_bootstrap_ci"] = enabled
+            fcp = data["treatment"]["Windows"]["numerical"]["fcp_time"]
+            fcp["tests"] = {"mwu": {"score": 0, "p-value": 0.01, "effect": 0.2}}
+            fcp["median_lift_ci"] = {"lower": 0.01, "upper": 0.05}
+            html = " ".join(ReportGenerator(data).createHTMLReport().split())
+            self.assertIn(expected, html)
 
 
 if __name__ == "__main__":
