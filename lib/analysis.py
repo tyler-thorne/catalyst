@@ -1,5 +1,7 @@
-from scipy import stats
+from scipy import stats, sparse
 import numpy as np
+import pandas as pd
+import hashlib
 
 
 # Expand the histogram into an array of values
@@ -134,8 +136,9 @@ def calc_histogram_mean_var(bins, counts):
 
 def calc_histogram_percentile(bins, counts, q):
     """Calculate the q-th percentile (0 < q < 1) from histogram bins and counts."""
-    # Convert counts to int in case they're decimal.Decimal from BigQuery
-    counts = [int(c) for c in counts]
+    # float, not int: bootstrap replicate counts are fractional weighted sums,
+    # and BigQuery may return decimal.Decimal
+    counts = [float(c) for c in counts]
     total_count = sum(counts)
     if total_count == 0:
         return 0.0
@@ -271,7 +274,141 @@ def calc_confidence_interval(data, confidence=0.95):
     return [m, se, m - h, m + h]
 
 
+def _bootstrap_seed(slug: str, metric_name: str, branch_name: str, segment: str) -> int:
+    """Deterministic seed so CI bounds don't jitter between runs. Per-segment,
+    so segments summed into "All" draw independent weights."""
+    key = f"{slug}:{metric_name}:{branch_name}:{segment}".encode()
+    return int(hashlib.md5(key).hexdigest()[:8], 16)
+
+
+def compute_client_cluster_bootstrap(
+    client_df, n_bootstrap, slug, metric_name, unit_col="client_id"
+):
+    """Cluster (Bayesian) bootstrap replicates, resampling whole units rather
+    than individual observations. `unit_col` is `client_id` for metrics-ping
+    histograms and `document_id` for pageload-ping events, which carry no
+    client_id.
+
+    `client_df` has one row per (unit, segment, branch) with a
+    `bucket_counts` list of {"bucket", "counts"} entries. Each unit gets an
+    Exponential(1) weight per iteration, and replicates come from one sparse
+    [units x buckets] matmul; sparse because pageload "buckets" are raw
+    millisecond values, far too many for a dense matrix at millions of units.
+
+    Returns a long DataFrame of (segment, branch, bucket, counts,
+    bootstrap_replicates).
+    """
+    rows = []
+    for (segment, branch), group in client_df.groupby(["segment", "branch"]):
+        # Canonical unit order so a fixed seed reproduces the same result.
+        group = group.sort_values(unit_col).reset_index(drop=True)
+        n_units = len(group)
+
+        buckets = sorted(
+            {
+                entry["bucket"]
+                for bucket_counts in group["bucket_counts"]
+                for entry in bucket_counts
+            }
+        )
+        bucket_index = {b: i for i, b in enumerate(buckets)}
+
+        row_idx, col_idx, values = [], [], []
+        for row_i, bucket_counts in enumerate(group["bucket_counts"]):
+            for entry in bucket_counts:
+                row_idx.append(row_i)
+                col_idx.append(bucket_index[entry["bucket"]])
+                values.append(float(entry["counts"]))
+        data_matrix = sparse.csr_matrix(
+            (values, (row_idx, col_idx)), shape=(n_units, len(buckets))
+        )
+
+        seed = _bootstrap_seed(slug, metric_name, branch, segment)
+        rng = np.random.default_rng(seed)
+        weights = rng.exponential(scale=1.0, size=(n_units, n_bootstrap))
+
+        counts = np.asarray(data_matrix.sum(axis=0)).ravel()
+        # Sparse on the left so scipy doesn't densify it.
+        replicates = (data_matrix.T @ weights).T  # (n_bootstrap, n_buckets)
+
+        for bi, bucket in enumerate(buckets):
+            rows.append(
+                {
+                    "segment": segment,
+                    "branch": branch,
+                    "bucket": bucket,
+                    "counts": counts[bi],
+                    "bootstrap_replicates": replicates[:, bi],
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _replicate_histograms(replicates):
+    """Per-bucket replicate arrays -> one histogram per bootstrap iteration."""
+    return np.array(replicates).T
+
+
+def calc_bootstrap_ci(
+    control_bins,
+    control_replicates,
+    treatment_bins,
+    treatment_replicates,
+    quantiles=(0.5, 0.75, 0.95),
+    confidence=0.95,
+):
+    """CI on the relative lift (treatment / control - 1) at each quantile, as
+    {quantile: {"lower", "upper"}}.
+
+    Bounds are None unless both branches have cluster bootstrap replicates.
+    Resampling pooled observations instead ignores clustering and gives
+    miscalibrated intervals."""
+    if not control_replicates or not treatment_replicates:
+        return {q: {"lower": None, "upper": None} for q in quantiles}
+
+    lifts = {q: [] for q in quantiles}
+    for ctrl, trt in zip(
+        _replicate_histograms(control_replicates),
+        _replicate_histograms(treatment_replicates),
+    ):
+        for q in quantiles:
+            c = calc_histogram_percentile(control_bins, ctrl, q)
+            t = calc_histogram_percentile(treatment_bins, trt, q)
+            lifts[q].append(t / c - 1 if c > 0 else 0.0)
+
+    alpha = (1 - confidence) / 2
+    return {
+        q: {
+            "lower": float(np.percentile(lifts[q], alpha * 100)),
+            "upper": float(np.percentile(lifts[q], (1 - alpha) * 100)),
+        }
+        for q in quantiles
+    }
+
+
+def calc_cdf_band(bins, x_values, replicates, confidence=0.95):
+    """Bootstrap confidence envelope for a CDF at `x_values`, or None bounds
+    without cluster replicates (see calc_bootstrap_ci)."""
+    if not replicates:
+        return {"lower": [None] * len(x_values), "upper": [None] * len(x_values)}
+
+    bins_arr = np.array([float(b) for b in bins])
+    boot_cdfs = []
+    for resampled in _replicate_histograms(replicates):
+        total = resampled.sum()
+        if total > 0:
+            boot_cdfs.append(np.interp(x_values, bins_arr, np.cumsum(resampled) / total))
+
+    alpha = (1 - confidence) / 2
+    return {
+        "lower": np.percentile(boot_cdfs, alpha * 100, axis=0).tolist(),
+        "upper": np.percentile(boot_cdfs, (1 - alpha) * 100, axis=0).tolist(),
+    }
+
+
 def createNumericalTemplate():
+    ci_empty = {"lower": None, "upper": None}
     template = {
         "desc": "",
         "mean": 0,
@@ -284,6 +421,9 @@ def createNumericalTemplate():
         "quantiles": [],
         "quantile_vals": [],
         "tests": {},
+        "median_lift_ci": dict(ci_empty),
+        "p75_lift_ci": dict(ci_empty),
+        "p95_lift_ci": dict(ci_empty),
     }
     return template
 
@@ -372,6 +512,9 @@ class DataAnalyzer:
             bins = data["bins"]
             counts = data["counts"]
             calculate_histogram_stats(bins, counts, result_location)
+            if "bootstrap_replicates" in data:
+                result_location["bins"] = bins
+                result_location["bootstrap_replicates"] = data["bootstrap_replicates"]
 
             # Print overflow warning if detected
             if "overflow_warning" in result_location:
@@ -399,6 +542,19 @@ class DataAnalyzer:
                     calculate_histogram_tests_subsampling(
                         control_data, data, result_location
                     )
+
+                    ci = calc_bootstrap_ci(
+                        control_data["bins"],
+                        control_data.get("bootstrap_replicates"),
+                        data["bins"],
+                        data.get("bootstrap_replicates"),
+                    )
+                    for name, q in (("median", 0.5), ("p75", 0.75), ("p95", 0.95)):
+                        result_location[f"{name}_lift_ci"] = ci[q]
+                    if data.get("bootstrap_replicates"):
+                        result_location["bootstrap_iterations"] = len(
+                            data["bootstrap_replicates"][0]
+                        )
 
     def processCategoricalMetrics(self, categorical_metrics):
         """Process all categorical metrics with unified algorithms."""
